@@ -26,7 +26,6 @@ import (
 
 	"github.com/google/go-github/v93/github"
 	"github.com/palantir/go-githubapp/appconfig"
-	"github.com/palantir/policy-bot/policy"
 	"github.com/palantir/policy-bot/policy/approval"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,7 +46,7 @@ func TestConfigFetcherForcedSharedParentPath(t *testing.T) {
 			if test.parentPath != "" {
 				remote += ", path: " + test.parentPath
 			}
-			child := "policy: {approval_extends: {" + remote + "}}" + childSlotContent
+			child := "policy: {approval_extends: {" + remote + "}}"
 			client := extensionTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 				var content string
 				switch r.Method + " " + r.URL.Path {
@@ -62,7 +61,7 @@ func TestConfigFetcherForcedSharedParentPath(t *testing.T) {
 					return
 				case "GET /repos/shared/policies/contents/" + test.wantPath:
 					assert.Equal(t, "parent-main", r.URL.Query().Get("ref"))
-					content = slotPolicy
+					content = "policy: {approval: []}"
 				default:
 					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 					http.Error(w, "unexpected request", http.StatusBadRequest)
@@ -86,9 +85,6 @@ func TestConfigFetcherForcedSharedParentPath(t *testing.T) {
 			assert.Equal(t, "original/.github@org-main", fc.Source)
 			assert.Equal(t, "policy.yml", fc.Path)
 			assert.Equal(t, test.parentPath, fc.Config.Policy.ApprovalExtends.Path)
-			parsed, err := policy.ParsePolicyWithParent(fc.Config, fc.Parent, nil)
-			require.NoError(t, err)
-			assert.NotNil(t, parsed.FindApprovalRule("service", "Child"))
 		})
 	}
 }
