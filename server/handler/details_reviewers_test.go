@@ -89,6 +89,58 @@ approval_rules:
 	}
 }
 
+func TestDetailsExtensionErrorLinks(t *testing.T) {
+	for _, test := range []struct {
+		name, parentURL, errorText string
+		parent                     appconfig.Config
+		loadError                  error
+	}{
+		{
+			name: "invalid parent", errorText: "failed to parse parent approval policy",
+			parent: appconfig.Config{
+				Content: []byte("policy: {approval: [missing]}"), Source: "shared/policies@release", Path: "rules/parent.yml",
+			},
+			parentURL: "https://github.example.com/shared/policies/blob/release/rules/parent.yml",
+		},
+		{
+			name: "unresolved parent ref", errorText: "failed to get remote repository",
+			parent:    appconfig.Config{Source: "shared/policies", Path: "rules/parent.yml"},
+			loadError: errors.New("failed to get remote repository"),
+			parentURL: "https://github.example.com/shared/policies",
+		},
+		{
+			name: "unknown parent", errorText: "parent unavailable",
+			loadError: errors.New("parent unavailable"),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			loader := mockConfigLoader{
+				loadConfig: func(context.Context, *github.Client, string, string, string) (appconfig.Config, error) {
+					return appconfig.Config{
+						Content: []byte("policy: {approval_extends: {remote: shared/policies, path: rules/parent.yml}}"),
+						Source:  "example/service@main", Path: "child.yml",
+					}, nil
+				},
+				loadRemoteRef: func(context.Context, *github.Client, string, appconfig.RemoteRef) (appconfig.Config, error) {
+					return test.parent, test.loadError
+				},
+			}
+			response := requestDetails(t, "read", loader, "/details/example/service/1")
+			assert.Equal(t, http.StatusOK, response.Code)
+			body := response.Body.String()
+			assert.Contains(t, body, test.errorText)
+			assert.Contains(t, body, `href="https://github.example.com/example/service/blob/main/child.yml"`)
+			if test.parentURL == "" {
+				assert.NotContains(t, body, ">Parent policy</a>")
+			} else {
+				assert.Contains(t, body, ">Child policy</a>")
+				assert.Contains(t, body, `href="`+test.parentURL+`"`)
+				assert.Contains(t, body, ">Parent policy</a>")
+			}
+		})
+	}
+}
+
 func requestDetails(t *testing.T, permission string, loader ConfigLoader, target string) *httptest.ResponseRecorder {
 	t.Helper()
 	repo := &github.Repository{
@@ -114,6 +166,12 @@ func requestDetails(t *testing.T, permission string, loader ConfigLoader, target
 		case "GET /repos/example/service/pulls/1":
 			assert.NotEqual(t, "none", permission)
 			assert.NoError(t, json.NewEncoder(w).Encode(pr))
+		case "POST /repos/example/service/statuses/head":
+			assert.Equal(t, "/details/example/service/1", target, "reviewer requests must not post statuses")
+			var status github.RepoStatus
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(&status))
+			assert.Equal(t, "error", status.GetState())
+			assert.NoError(t, json.NewEncoder(w).Encode(status))
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected request", http.StatusBadRequest)
@@ -128,6 +186,9 @@ func requestDetails(t *testing.T, permission string, loader ConfigLoader, target
 		},
 	}
 	mux := goji.NewMux()
+	mux.HandleFunc(pat.Get("/details/:owner/:repo/:number"), func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, h.ServeHTTP(w, r))
+	})
 	reviewers := &DetailsReviewers{Details: *h}
 	mux.HandleFunc(pat.Get("/details/:owner/:repo/:number/reviewers"), func(w http.ResponseWriter, r *http.Request) {
 		require.NoError(t, reviewers.ServeHTTP(w, r))
