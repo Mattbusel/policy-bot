@@ -64,7 +64,7 @@ func TestApprovalExtendsDecoding(t *testing.T) {
 		require.NoError(t, yaml.UnmarshalStrict([]byte(input), &c))
 		_, err := ParsePolicy(&c, nil)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "approval_extends requires a resolved parent")
+		assert.Contains(t, err.Error(), "authenticated simulation")
 	}
 }
 

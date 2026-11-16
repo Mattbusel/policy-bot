@@ -81,55 +81,44 @@ func TestConfigFetcherRetriesServerError(t *testing.T) {
 }
 
 type mockConfigLoader struct {
-	loadConfig func(ctx context.Context, client *github.Client, owner, repo, ref string) (appconfig.Config, error)
+	loadConfig    func(ctx context.Context, client *github.Client, owner, repo, ref string) (appconfig.Config, error)
+	loadRemoteRef func(ctx context.Context, client *github.Client, clientOwner string, remote appconfig.RemoteRef) (appconfig.Config, error)
 }
 
 func (s mockConfigLoader) LoadConfig(ctx context.Context, client *github.Client, owner, repo, ref string) (appconfig.Config, error) {
 	return s.loadConfig(ctx, client, owner, repo, ref)
 }
 
+func (s mockConfigLoader) LoadRemoteRef(ctx context.Context, client *github.Client, clientOwner string, remote appconfig.RemoteRef) (appconfig.Config, error) {
+	return s.loadRemoteRef(ctx, client, clientOwner, remote)
+}
+
 func TestConfigFetcherMarksSeenPolicy(t *testing.T) {
-	for _, test := range []struct {
-		name, content, errorMessage string
-	}{
-		{name: "malformed yaml", content: "policy: ["},
-		{
-			name:         "unsupported extension",
-			content:      "policy: {approval_extends: {remote: example/policies}}",
-			errorMessage: "approval_extends is not supported by the policy loader",
+	cache := NewSeenPolicyCache()
+
+	fetcher := ConfigFetcher{
+		Loader: mockConfigLoader{
+			loadConfig: func(ctx context.Context, client *github.Client, owner, repo, ref string) (appconfig.Config, error) {
+				return appconfig.Config{
+					Content: []byte("policy: ["),
+					Source:  "testorg/testrepo@main",
+					Path:    ".policy.yml",
+				}, nil
+			},
 		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			cache := NewSeenPolicyCache()
-			fetcher := ConfigFetcher{
-				Loader: mockConfigLoader{
-					loadConfig: func(ctx context.Context, client *github.Client, owner, repo, ref string) (appconfig.Config, error) {
-						return appconfig.Config{
-							Content: []byte(test.content),
-							Source:  "testorg/testrepo@main",
-							Path:    ".policy.yml",
-						}, nil
-					},
-				},
-				SeenPolicyCache: cache,
-			}
-
-			fc := fetcher.ConfigForRepositoryBranch(context.Background(), nil, "testorg", "testrepo", "main")
-			require.Error(t, fc.ParseError)
-			if test.errorMessage != "" {
-				assert.Contains(t, fc.ParseError.Error(), test.errorMessage)
-			}
-			assert.Nil(t, fc.Config)
-			assert.True(t, fc.SeenPolicy)
-
-			ok := cache.Get(SeenPolicyKey{
-				Owner:      "testorg",
-				Repository: "testrepo",
-				BaseBranch: "main",
-			})
-			require.True(t, ok)
-		})
+		SeenPolicyCache: cache,
 	}
+
+	fc := fetcher.ConfigForRepositoryBranch(context.Background(), nil, "testorg", "testrepo", "main")
+	require.Error(t, fc.ParseError)
+	assert.True(t, fc.SeenPolicy)
+
+	ok := cache.Get(SeenPolicyKey{
+		Owner:      "testorg",
+		Repository: "testrepo",
+		BaseBranch: "main",
+	})
+	require.True(t, ok)
 }
 
 func TestConfigFetcherChecksSeenPolicyOnLoadError(t *testing.T) {

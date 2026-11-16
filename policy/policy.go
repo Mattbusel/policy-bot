@@ -157,7 +157,7 @@ func ParsePolicyWithParent(child, parent *Config, opts *GlobalOptions) (*ParsedP
 			return nil, errors.WithMessage(err, "invalid approval_extends")
 		}
 		if parent == nil {
-			return nil, errors.New("approval_extends requires a resolved parent")
+			return nil, errors.New("approval_extends requires a resolved parent; use authenticated simulation for full validation")
 		}
 		if parent.Policy.ApprovalExtends != nil {
 			return nil, errors.New("an approval parent cannot specify approval_extends")
