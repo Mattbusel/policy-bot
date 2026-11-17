@@ -154,24 +154,33 @@ func TestConfigFetcherParentFailures(t *testing.T) {
 }
 
 func TestConfigFetcherInvalidExtensionDoesNotLoadParent(t *testing.T) {
-	fetcher := ConfigFetcher{Loader: mockConfigLoader{
-		loadConfig: func(context.Context, *github.Client, string, string, string) (appconfig.Config, error) {
-			return appconfig.Config{
-				Content: []byte("policy: {approval: [], approval_extends: {remote: shared/policies}}"),
-				Source:  "original/service@release",
-				Path:    ".policy.yml",
-			}, nil
-		},
-		loadRemoteRef: func(context.Context, *github.Client, string, appconfig.RemoteRef) (appconfig.Config, error) {
-			t.Error("invalid extension requested a parent")
-			return appconfig.Config{}, nil
-		},
-	}}
-	fc := fetcher.ConfigForRepositoryBranch(context.Background(), nil, "original", "service", "release")
-	require.ErrorContains(t, fc.ParseError, "approval and approval_extends cannot both be specified")
-	assert.Nil(t, fc.Config)
-	assert.True(t, fc.SeenPolicy)
-	assert.Equal(t, "original/service@release", fc.Source)
+	for _, test := range []struct {
+		name, content, message string
+	}{
+		{"conflicting approval", "policy: {approval: [], approval_extends: {remote: shared/policies}}", "approval and approval_extends cannot both be specified"},
+		{"malformed reference", "policy: {approval_extends: {remote: shared/}}", "invalid approval_extends: invalid remote value: shared/"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fetcher := ConfigFetcher{Loader: mockConfigLoader{
+				loadConfig: func(context.Context, *github.Client, string, string, string) (appconfig.Config, error) {
+					return appconfig.Config{
+						Content: []byte(test.content),
+						Source:  "original/service@release",
+						Path:    ".policy.yml",
+					}, nil
+				},
+				loadRemoteRef: func(context.Context, *github.Client, string, appconfig.RemoteRef) (appconfig.Config, error) {
+					t.Error("invalid extension requested a parent")
+					return appconfig.Config{}, nil
+				},
+			}}
+			fc := fetcher.ConfigForRepositoryBranch(context.Background(), nil, "original", "service", "release")
+			require.ErrorContains(t, fc.ParseError, test.message)
+			assert.Nil(t, fc.Config)
+			assert.True(t, fc.SeenPolicy)
+			assert.Equal(t, "original/service@release", fc.Source)
+		})
+	}
 }
 
 func TestConfigFetcherParentRetry(t *testing.T) {

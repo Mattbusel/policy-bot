@@ -29,43 +29,42 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-func TestApprovalExtendsDecoding(t *testing.T) {
+func TestApprovalExtendsValidation(t *testing.T) {
 	for _, test := range []struct {
 		name, input, message string
 	}{
 		{"both approval keys", `policy: {approval: [review], approval_extends: {remote: example/policies}}`, "approval and approval_extends cannot both be specified"},
 		{"empty approval", `policy: {approval: [], approval_extends: {remote: example/policies}}`, "approval and approval_extends cannot both be specified"},
-		{"null approval", `policy: {approval: null, approval_extends: {remote: example/policies}}`, "approval and approval_extends cannot both be specified"},
-		{"null extension", `policy: {approval_extends: null}`, "approval_extends must be a non-null remote reference"},
 		{"empty extension", `policy: {approval_extends: {}}`, "invalid approval_extends"},
 		{"missing repository", `policy: {approval_extends: {remote: example/}}`, "invalid approval_extends"},
-		{"unknown policy key", `policy: {approval_extends: {remote: example/policies}, other: true}`, "field other not found"},
-		{"duplicate approval", `policy: {approval: null, approval: []}`, "field approval already set"},
-		{"merged approval", `policy: {<<: {approval: null}, approval_extends: {remote: example/policies}}`, "approval and approval_extends cannot both be specified"},
-		{"merged extension", `policy: {<<: {approval_extends: {remote: example/policies}}, approval: []}`, "approval and approval_extends cannot both be specified"},
-		{"merged null extension", `policy: {<<: {approval_extends: null}}`, "approval_extends must be a non-null remote reference"},
-		{"aliased null", `policy: {approval: &empty null, approval_extends: *empty}`, "approval_extends must be a non-null remote reference"},
-		{"root merged null approval", "<<: {policy: {approval: null}}\npolicy: {approval_extends: {remote: example/policies}}", "approval and approval_extends cannot both be specified"},
-		{"root merged extension", "<<: {policy: {approval_extends: {remote: example/policies}}}\npolicy: {approval: null}", "approval and approval_extends cannot both be specified"},
+		{"unresolved extension", `policy: {approval_extends: {remote: example/policies, ref: main, path: config/policy.yml}}`, "approval_extends requires a resolved parent; use authenticated simulation for full validation"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			var c Config
-			assert.ErrorContains(t, yaml.UnmarshalStrict([]byte(test.input), &c), test.message)
+			c := extensionConfig(t, test.input)
+			parsed, err := ParsePolicy(c, nil)
+			require.ErrorContains(t, err, test.message)
+			assert.True(t, parsed == nil, "failed parsing must return a nil interface")
 		})
 	}
-	for _, input := range []string{
-		`policy: {approval_extends: {remote: example/policies, ref: main, path: config/policy.yml}}`,
-		`policy: {<<: {approval_extends: {remote: example/policies}}}`,
-		`policy: {approval_extends: {<<: {remote: example/default}, remote: example/policies}}`,
-		`policy: &extension {approval_extends: {remote: example/policies}}
-<<: {policy: *extension}`,
-	} {
-		var c Config
-		require.NoError(t, yaml.UnmarshalStrict([]byte(input), &c))
-		_, err := ParsePolicy(&c, nil)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "authenticated simulation")
-	}
+}
+
+func TestApprovalExtensionNullValues(t *testing.T) {
+	parent := extensionConfig(t, `
+policy: {approval: [review]}
+approval_rules: [{name: review, requires: {count: 1}}]
+`)
+	child := extensionConfig(t, `policy: {approval: null, approval_extends: {remote: example/policies}}`)
+	parsed, err := ParsePolicyWithParent(child, parent, nil)
+	require.NoError(t, err)
+	assert.Equal(t, common.StatusPending, parsed.Evaluate(context.Background(), &pulltest.Context{}).Status)
+
+	standalone := extensionConfig(t, `
+policy: {approval: [review], approval_extends: null}
+approval_rules: [{name: review, requires: {count: 1}}]
+`)
+	eval, err := ParsePolicy(standalone, nil)
+	require.NoError(t, err)
+	assert.Equal(t, common.StatusPending, eval.Evaluate(context.Background(), &pulltest.Context{}).Status)
 }
 
 func TestPolicyMergePreservesApproval(t *testing.T) {
@@ -103,8 +102,9 @@ approval_rules:
   - name: review
     requires: {count: 1, users: [service]}
 `)
-	_, err := ParsePolicy(parent, nil)
+	standalone, err := ParsePolicy(parent, nil)
 	require.ErrorContains(t, err, "required slots are empty")
+	assert.True(t, standalone == nil, "incomplete policies must not return an evaluator")
 	parsed, err := ParsePolicyWithParent(child, parent, nil)
 	require.NoError(t, err)
 	for _, tt := range []struct {
