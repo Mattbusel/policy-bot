@@ -49,58 +49,19 @@ type Policy struct {
 	Approval        approval.Policy      `yaml:"approval,omitempty"`
 	ApprovalExtends *appconfig.RemoteRef `yaml:"approval_extends,omitempty"`
 	Disapproval     *disapproval.Policy  `yaml:"disapproval,omitempty"`
-
-	// Root-level YAML merges can decode this struct more than once. Retain
-	// explicit null approval keys so a later extension cannot hide their presence.
-	approvalSet bool
 }
 
-// UnmarshalYAML preserves key presence: null approval conflicts with an extension,
-// and a null extension is rejected instead of becoming a standalone policy.
-func (p *Policy) UnmarshalYAML(unmarshal func(any) error) error {
-	type plain Policy
-	decoded := plain(*p)
-	if err := unmarshal(&decoded); err != nil {
-		return err
+// ValidateApprovalExtends checks the extension before a loader fetches its parent.
+func (p Policy) ValidateApprovalExtends() error {
+	if p.ApprovalExtends == nil {
+		return nil
 	}
-
-	// Typed decoding loses the distinction between an absent key and null.
-	// Use a struct to retain the same merge behavior as the typed decoding.
-	fields := struct {
-		Approval        yamlFieldPresence `yaml:"approval"`
-		ApprovalExtends yamlFieldPresence `yaml:"approval_extends"`
-		Disapproval     yamlFieldPresence `yaml:"disapproval"`
-	}{
-		Approval:        yamlFieldPresence{absent: true},
-		ApprovalExtends: yamlFieldPresence{absent: true},
-	}
-	if err := unmarshal(&fields); err != nil {
-		return err
-	}
-	decoded.approvalSet = decoded.approvalSet || !fields.Approval.absent
-	if !fields.ApprovalExtends.absent {
-		if decoded.ApprovalExtends == nil {
-			return errors.New("approval_extends must be a non-null remote reference")
-		}
-		if _, _, err := decoded.ApprovalExtends.SplitRemote(); err != nil {
-			return errors.WithMessage(err, "invalid approval_extends")
-		}
-	}
-	if decoded.approvalSet && decoded.ApprovalExtends != nil {
+	if p.Approval != nil {
 		return errors.New("approval and approval_extends cannot both be specified")
 	}
-	*p = Policy(decoded)
-	return nil
-}
-
-// Both a decoded null and a call to UnmarshalYAML clear absent. Ignoring the
-// contents here is safe because the typed decoder above validates them first.
-type yamlFieldPresence struct {
-	absent bool
-}
-
-func (p *yamlFieldPresence) UnmarshalYAML(_ func(any) error) error {
-	p.absent = false
+	if _, _, err := p.ApprovalExtends.SplitRemote(); err != nil {
+		return errors.WithMessage(err, "invalid approval_extends")
+	}
 	return nil
 }
 
@@ -121,7 +82,7 @@ func ParsePolicy(c *Config, opts *GlobalOptions) (common.Evaluator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parsed.evaluator, nil
+	return parsed, nil
 }
 
 // ParsedPolicy provides the evaluator, event methods, and rule lookup for one
@@ -148,61 +109,79 @@ func (p *ParsedPolicy) FindApprovalRule(slot, name string) *approval.Rule {
 // policy. Rules use the defaults from the file that defines them, and only the
 // child's disapproval policy applies. Pass a nil parent for a standalone policy.
 func ParsePolicyWithParent(child, parent *Config, opts *GlobalOptions) (*ParsedPolicy, error) {
-	base := child
-	if child.Policy.ApprovalExtends != nil {
-		if child.Policy.approvalSet || child.Policy.Approval != nil {
-			return nil, errors.New("approval and approval_extends cannot both be specified")
-		}
-		if _, _, err := child.Policy.ApprovalExtends.SplitRemote(); err != nil {
-			return nil, errors.WithMessage(err, "invalid approval_extends")
-		}
-		if parent == nil {
+	if err := child.Policy.ValidateApprovalExtends(); err != nil {
+		return nil, err
+	}
+	if parent == nil {
+		if child.Policy.ApprovalExtends != nil {
 			return nil, errors.New("approval_extends requires a resolved parent")
 		}
-		if parent.Policy.ApprovalExtends != nil {
-			return nil, errors.New("an approval parent cannot specify approval_extends")
+		file, err := parsePolicyFile(child, opts)
+		if err != nil {
+			return nil, err
 		}
-		base = parent
-	} else if parent != nil {
+		parsed := &ParsedPolicy{slotRules: make(map[string]map[string]*approval.Rule)}
+		parsed.applySlotContents(file, file.slots)
+		return parsed.complete(file, child.Policy.Disapproval, child.ApprovalRules)
+	}
+	if child.Policy.ApprovalExtends == nil {
 		return nil, errors.New("a parent was supplied without approval_extends")
 	}
+	if parent.Policy.ApprovalExtends != nil {
+		return nil, errors.New("an approval parent cannot specify approval_extends")
+	}
+	base, err := parsePolicyFile(parent, opts)
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed to parse parent approval policy")
+	}
+	extension, err := parsePolicyFile(child, opts)
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed to parse child approval policy")
+	}
+	parsed := &ParsedPolicy{slotRules: make(map[string]map[string]*approval.Rule)}
+	parsed.applySlotContents(base, base.slots)
+	parsed.applySlotContents(extension, base.slots)
+	return parsed.complete(base, child.Policy.Disapproval, base.approval.Rules())
+}
 
-	baseDescription := "approval policy"
-	if parent != nil {
-		baseDescription = "parent approval policy"
-	}
-	baseRules, err := prepareRules(base, opts)
+// parsedFile keeps per-file parsing separate from filling slots and validating
+// required content in the completed policy.
+type parsedFile struct {
+	approval     approval.Evaluator
+	rules        map[string]*approval.Rule
+	slots        map[string]*approval.SlotRule
+	slotContents map[string]approval.Evaluator
+}
+
+func parsePolicyFile(c *Config, opts *GlobalOptions) (*parsedFile, error) {
+	rules, err := prepareRules(c, opts)
 	if err != nil {
-		if parent != nil {
-			return nil, errors.WithMessage(err, "failed to parse parent approval policy")
-		}
 		return nil, err
 	}
-	evalApproval, slots, err := base.Policy.Approval.Parse(baseRules)
+	evalApproval, slots, err := c.Policy.Approval.Parse(rules)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to parse %s", baseDescription)
+		return nil, errors.Wrap(err, "failed to parse approval policy")
 	}
-	parsed := &ParsedPolicy{
-		baseRules: baseRules,
-		slotRules: make(map[string]map[string]*approval.Rule),
-	}
-	if err := parsed.applySlotContents(base, baseRules, slots); err != nil {
-		if parent != nil {
-			return nil, errors.WithMessage(err, "failed to parse parent approval policy")
+	contents := make(map[string]approval.Evaluator, len(c.Slots))
+	for name, slotContent := range c.Slots {
+		if name == "" {
+			return nil, errors.New("slot name must be nonempty")
 		}
-		return nil, err
-	}
-	if parent != nil {
-		childRules, err := prepareRules(child, opts)
+		slotEvaluator, err := slotContent.ParseAsSlotContent(rules)
 		if err != nil {
-			return nil, errors.WithMessage(err, "failed to parse child approval rules")
+			return nil, errors.Wrapf(err, "failed to parse slot content %q", name)
 		}
-		if err := parsed.applySlotContents(child, childRules, slots); err != nil {
-			return nil, errors.WithMessage(err, "failed to parse child slot content")
+		if slots[name] == nil && c.Policy.ApprovalExtends == nil {
+			return nil, errors.Errorf("slot content %q does not match a declared slot", name)
 		}
+		contents[name] = slotEvaluator
 	}
+	return &parsedFile{approval: evalApproval, rules: rules, slots: slots, slotContents: contents}, nil
+}
+
+func (p *ParsedPolicy) complete(base *parsedFile, evalDisapproval *disapproval.Policy, rules []*approval.Rule) (*ParsedPolicy, error) {
 	var missing []string
-	for name, slot := range slots {
+	for name, slot := range base.slots {
 		if slot.Required && slot.Child == nil {
 			missing = append(missing, name)
 		}
@@ -212,23 +191,19 @@ func ParsePolicyWithParent(child, parent *Config, opts *GlobalOptions) (*ParsedP
 		return nil, errors.Errorf("required slots are empty: %q", missing)
 	}
 
-	rules := child.ApprovalRules
-	if parent != nil {
-		rules = approval.Rules(evalApproval)
-	}
 	for _, rule := range rules {
-		parsed.methods = append(parsed.methods, rule.Options.GetMethods())
+		p.methods = append(p.methods, rule.Options.GetMethods())
 	}
-	evalDisapproval := child.Policy.Disapproval
 	if evalDisapproval == nil {
 		evalDisapproval = &disapproval.Policy{}
 	} else {
-		parsed.methods = append(parsed.methods,
+		p.methods = append(p.methods,
 			evalDisapproval.Options.GetDisapproveMethods(),
 			evalDisapproval.Options.GetRevokeMethods())
 	}
-	parsed.evaluator = evaluator{approval: evalApproval, disapproval: evalDisapproval}
-	return parsed, nil
+	p.evaluator = evaluator{approval: base.approval, disapproval: evalDisapproval}
+	p.baseRules = base.rules
+	return p, nil
 }
 
 func prepareRules(c *Config, opts *GlobalOptions) (map[string]*approval.Rule, error) {
@@ -272,30 +247,19 @@ func prepareRules(c *Config, opts *GlobalOptions) (map[string]*approval.Rule, er
 	return rulesByName, nil
 }
 
-func (p *ParsedPolicy) applySlotContents(c *Config, rulesByName map[string]*approval.Rule, slots map[string]*approval.SlotRule) error {
-	for name, slotContent := range c.Slots {
-		if name == "" {
-			return errors.New("slot name must be nonempty")
-		}
-		slotEvaluator, err := slotContent.ParseAsSlotContent(rulesByName)
-		if err != nil {
-			return errors.Wrapf(err, "failed to parse slot content %q", name)
-		}
+func (p *ParsedPolicy) applySlotContents(file *parsedFile, slots map[string]*approval.SlotRule) {
+	for name, slotEvaluator := range file.slotContents {
 		slot := slots[name]
 		if slot == nil {
-			if c.Policy.ApprovalExtends == nil {
-				return errors.Errorf("slot content %q does not match a declared slot", name)
-			}
 			continue
 		}
 		slot.Child = slotEvaluator
 		if slotEvaluator == nil {
 			delete(p.slotRules, name)
 		} else {
-			p.slotRules[name] = rulesByName
+			p.slotRules[name] = file.rules
 		}
 	}
-	return nil
 }
 
 func setDefaultOptions(existing *approval.Options, next *approval.Options) *approval.Options {

@@ -97,6 +97,8 @@ func (cf *ConfigFetcher) ConfigForRepositoryBranch(ctx context.Context, client *
 		var pc policy.Config
 		if err := yaml.UnmarshalStrict(c.Content, &pc); err != nil {
 			fc.ParseError = err
+		} else if err := pc.Policy.ValidateApprovalExtends(); err != nil {
+			fc.ParseError = err
 		} else if pc.Policy.ApprovalExtends != nil {
 			fc.ParseError = errors.New("approval_extends is not supported by the policy loader")
 		} else {
