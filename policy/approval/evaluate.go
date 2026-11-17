@@ -23,36 +23,22 @@ import (
 	"github.com/rs/zerolog"
 )
 
-type evaluator struct {
-	root common.Evaluator
+type Evaluator interface {
+	common.Evaluator
+
+	// Rules returns the retained rules without evaluating their predicates.
+	Rules() []*Rule
 }
 
-// Rules returns the rules retained in the approval tree, including selected
-// slot content. It does not evaluate predicates, so future relevant events still
-// trigger evaluation when a rule is currently skipped.
-func Rules(eval common.Evaluator) []*Rule {
-	var rules []*Rule
-	var visit func(common.Evaluator)
-	visit = func(eval common.Evaluator) {
-		switch eval := eval.(type) {
-		case *evaluator:
-			visit(eval.root)
-		case *RuleRequirement:
-			rules = append(rules, eval.rule)
-		case *SlotRule:
-			visit(eval.Child)
-		case *AndRequirement:
-			for _, child := range eval.requirements {
-				visit(child)
-			}
-		case *OrRequirement:
-			for _, child := range eval.requirements {
-				visit(child)
-			}
-		}
+type evaluator struct {
+	root Evaluator
+}
+
+func (eval *evaluator) Rules() []*Rule {
+	if eval.root != nil {
+		return eval.root.Rules()
 	}
-	visit(eval)
-	return rules
+	return nil
 }
 
 func (eval *evaluator) Trigger() common.Trigger {
@@ -79,7 +65,14 @@ func (eval *evaluator) Evaluate(ctx context.Context, prctx pull.Context) (res co
 type SlotRule struct {
 	Name     string
 	Required bool
-	Child    common.Evaluator
+	Child    Evaluator
+}
+
+func (r *SlotRule) Rules() []*Rule {
+	if r.Child != nil {
+		return r.Child.Rules()
+	}
+	return nil
 }
 
 func (r *SlotRule) Trigger() common.Trigger {
@@ -107,6 +100,10 @@ type RuleRequirement struct {
 	rule *Rule
 }
 
+func (r *RuleRequirement) Rules() []*Rule {
+	return []*Rule{r.rule}
+}
+
 func (r *RuleRequirement) Trigger() common.Trigger {
 	return r.rule.Trigger()
 }
@@ -132,7 +129,15 @@ func (r *RuleRequirement) Evaluate(ctx context.Context, prctx pull.Context) comm
 }
 
 type OrRequirement struct {
-	requirements []common.Evaluator
+	requirements []Evaluator
+}
+
+func (r *OrRequirement) Rules() []*Rule {
+	var rules []*Rule
+	for _, child := range r.requirements {
+		rules = append(rules, child.Rules()...)
+	}
+	return rules
 }
 
 func (r *OrRequirement) Trigger() common.Trigger {
@@ -192,7 +197,15 @@ func (r *OrRequirement) Evaluate(ctx context.Context, prctx pull.Context) common
 }
 
 type AndRequirement struct {
-	requirements []common.Evaluator
+	requirements []Evaluator
+}
+
+func (r *AndRequirement) Rules() []*Rule {
+	var rules []*Rule
+	for _, child := range r.requirements {
+		rules = append(rules, child.Rules()...)
+	}
+	return rules
 }
 
 func (r *AndRequirement) Trigger() common.Trigger {

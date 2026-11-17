@@ -80,8 +80,8 @@ func TestParsePolicy(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, eval)
 
-		evaluatorImpl, ok := eval.(evaluator)
-		assert.True(t, ok)
+		evaluatorImpl, ok := eval.(*ParsedPolicy)
+		require.True(t, ok)
 		assert.Equal(t, disapprovalPolicy, evaluatorImpl.disapproval)
 	})
 

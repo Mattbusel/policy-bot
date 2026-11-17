@@ -96,6 +96,10 @@ func (cf *ConfigFetcher) ConfigForRepositoryBranch(ctx context.Context, client *
 		fc.ParseError = err
 		return fc
 	}
+	if err := pc.Policy.ValidateApprovalExtends(); err != nil {
+		fc.ParseError = err
+		return fc
+	}
 	fc.Config = &pc
 	if pc.Policy.ApprovalExtends == nil {
 		return fc
